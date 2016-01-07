@@ -35,6 +35,7 @@
 
 namespace OCA\user_ldap\lib;
 
+use OC\HintException;
 use OCA\user_ldap\lib\user\OfflineUser;
 use OCA\User_LDAP\Mapping\AbstractMapping;
 
@@ -166,20 +167,72 @@ class Access extends LDAPUtility implements user\IUserTools {
 		// 0 won't result in replies, small numbers may leave out groups
 		// (cf. #12306), 500 is default for paging and should work everywhere.
 		$maxResults = $pagingSize > 20 ? $pagingSize : 500;
-		$this->initPagedSearch($filter, array($dn), array($attr), $maxResults, 0);
+		$attr = mb_strtolower($attr, 'UTF-8');
+		$attrToRead = $attr;
+
+		$values = [];
+		$isRangeRequest = false;
+		do {
+			$result = $this->executeReadOperation($cr, $dn, $attrToRead, $filter, $maxResults);
+			if(is_bool($result)) {
+				return $result ? [] : false;
+			}
+
+			if (!$isRangeRequest) {
+				$values = $this->extractAttributeValuesFromResult($result, $attr);
+				if (!empty($values)) {
+					return $values;
+				}
+			}
+
+			\OCP\Util::writeLog('user_ldap', 'Evaluating Range Request, attrToRead was ' . $attrToRead . ', LDAP error: ' . $this->ldap->error($cr) , \OCP\Util::DEBUG);
+
+			$isRangeRequest = false;
+			$result = $this->extractRangeData($result, $attr);
+			\OCP\Util::writeLog('user_ldap', 'data: ' . print_r($result, true), \OCP\Util::DEBUG);
+			if (!empty($result)) {
+
+				if(intval($result['values']['count']) === 0) {
+					return $values;
+				}
+				$normalizedResult = $this->extractAttributeValuesFromResult(
+					[ $attr => $result['values'] ],
+					$attr
+				);
+				$values = array_merge($values, $normalizedResult);
+		\OCP\Util::writeLog('user_ldap', 'read members: ' . count($values), \OCP\Util::DEBUG);
+				if($result['high'] === '*') {
+					return $values;
+				} else if((1 + $result['high'] - $result['low']) === $result['values']['count']) {
+					$low  = $result['high'] + 1;
+					$high = $result['high'] + $result['values']['count'];
+					$attrToRead = $result['attributeName'] . ';range=' . $low . '-' . $high;
+					$isRangeRequest = true;
+				} else {
+					return $values;
+				}
+			}
+		} while($isRangeRequest);
+
+		\OCP\Util::writeLog('user_ldap', 'Requested attribute '.$attr.' not found for '.$dn, \OCP\Util::DEBUG);
+		return false;
+	}
+
+	public function executeReadOperation($cr, $dn, $attribute, $filter, $maxResults) {
+		$this->initPagedSearch($filter, array($dn), array($attribute), $maxResults, 0);
 		$dn = $this->DNasBaseParameter($dn);
-		$rr = @$this->ldap->read($cr, $dn, $filter, array($attr));
+		$rr = @$this->ldap->read($cr, $dn, $filter, array($attribute));
 		if(!$this->ldap->isResource($rr)) {
-			if(!empty($attr)) {
+			if(!empty($attribute)) {
 				//do not throw this message on userExists check, irritates
 				\OCP\Util::writeLog('user_ldap', 'readAttribute failed for DN '.$dn, \OCP\Util::DEBUG);
 			}
 			//in case an error occurs , e.g. object does not exist
 			return false;
 		}
-		if (empty($attr) && ($filter === 'objectclass=*' || $this->ldap->countEntries($cr, $rr) === 1)) {
+		if (empty($attribute) && ($filter === 'objectclass=*' || $this->ldap->countEntries($cr, $rr) === 1)) {
 			\OCP\Util::writeLog('user_ldap', 'readAttribute: '.$dn.' found', \OCP\Util::DEBUG);
-			return array();
+			return true;
 		}
 		$er = $this->ldap->firstEntry($cr, $rr);
 		if(!$this->ldap->isResource($er)) {
@@ -188,24 +241,47 @@ class Access extends LDAPUtility implements user\IUserTools {
 		}
 		//LDAP attributes are not case sensitive
 		$result = \OCP\Util::mb_array_change_key_case(
-				$this->ldap->getAttributes($cr, $er), MB_CASE_LOWER, 'UTF-8');
-		$attr = mb_strtolower($attr, 'UTF-8');
+			$this->ldap->getAttributes($cr, $er), MB_CASE_LOWER, 'UTF-8');
 
-		if(isset($result[$attr]) && $result[$attr]['count'] > 0) {
-			$values = array();
-			for($i=0;$i<$result[$attr]['count'];$i++) {
-				if($this->resemblesDN($attr)) {
-					$values[] = $this->sanitizeDN($result[$attr][$i]);
-				} elseif(strtolower($attr) === 'objectguid' || strtolower($attr) === 'guid') {
-					$values[] = $this->convertObjectGUID2Str($result[$attr][$i]);
+		return $result;
+	}
+
+	public function extractAttributeValuesFromResult($result, $attribute) {
+		$values = [];
+		if(isset($result[$attribute]) && $result[$attribute]['count'] > 0) {
+			for($i=0;$i<$result[$attribute]['count'];$i++) {
+				if($this->resemblesDN($attribute)) {
+					$values[] = $this->sanitizeDN($result[$attribute][$i]);
+				} elseif(strtolower($attribute) === 'objectguid' || strtolower($attribute) === 'guid') {
+					$values[] = $this->convertObjectGUID2Str($result[$attribute][$i]);
 				} else {
-					$values[] = $result[$attr][$i];
+					$values[] = $result[$attribute][$i];
 				}
 			}
-			return $values;
 		}
-		\OCP\Util::writeLog('user_ldap', 'Requested attribute '.$attr.' not found for '.$dn, \OCP\Util::DEBUG);
-		return false;
+		return $values;
+	}
+
+	public function extractRangeData($result, $attribute) {
+		$keys = array_keys($result);
+		foreach($keys as $key) {
+			if($key !== $attribute && strpos($key, $attribute) === 0) {
+				$queryData = explode(';', $key);
+				if(strpos($queryData[1], 'range=') === 0) {
+					$range = explode('-', substr($queryData[1], strlen('range=')));
+					$data = [
+						'values' => $result[$key],
+						'attributeName' => $queryData[0],
+						'attributeFull' => $key,
+						'low' => $range[0],
+						'high' => $range[1],
+					];
+					return $data;
+				}
+
+			}
+		}
+		return [];
 	}
 
 	/**
